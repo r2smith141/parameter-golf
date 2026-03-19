@@ -553,11 +553,12 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    """Pseudo-Riemannian Geometric Attention (CFM).
+    """Euclidean Geometric Attention (v8_vmlp-style).
     
-    Replaces Q·K dot product with metric-weighted distance.
+    Replaces Q·K dot product with metric-weighted Euclidean distance.
+    Softplus metric = always positive force field in flat space.
+    k-NN is geometrically correct because distances are true L2.
     Uses GQA-equivalent grouping: full center heads, grouped metric+V.
-    Asymmetric timelike routing preserved.
     """
     def __init__(
         self,
@@ -580,14 +581,14 @@ class CausalSelfAttention(nn.Module):
 
         # Center projections: one per head (like Q — determines WHERE in geometric space)
         self.c_center = CastedLinear(dim, dim, bias=False)
-        # Metric projections: grouped (like K — determines local geometry)
+        # Force field projections: grouped (softplus → always positive, modulates distance)
         self.c_metric = CastedLinear(dim, kv_dim, bias=False)
         # Value projections: grouped (independent content channel)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
 
-        # Temperature per head (replaces q_gain)
+        # Temperature per head
         self.temperature = nn.Parameter(torch.full((num_heads,), qk_gain_init / math.sqrt(self.head_dim), dtype=torch.float32))
 
         # RoPE for position encoding on centers
@@ -599,8 +600,11 @@ class CausalSelfAttention(nn.Module):
 
         # Project centers, metric, values
         centers = self.c_center(x).reshape(bsz, seqlen, self.num_heads, d_h).transpose(1, 2)
-        metric = self.c_metric(x).reshape(bsz, seqlen, self.num_kv_heads, d_h).transpose(1, 2)
+        metric_raw = self.c_metric(x).reshape(bsz, seqlen, self.num_kv_heads, d_h).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, d_h).transpose(1, 2)
+
+        # Softplus → always positive force field (flat Euclidean space)
+        metric = F.softplus(metric_raw)
 
         # RMSNorm on centers (like QK norm in baseline)
         centers = F.rms_norm(centers, (centers.size(-1),))
@@ -616,22 +620,20 @@ class CausalSelfAttention(nn.Module):
             v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)
             v = v.reshape(bsz, self.num_heads, seqlen, d_h)
 
-        # --- FULL PSEUDO-RIEMANNIAN DISTANCE ---
-        # At T=1024 on H100 (80GB), full pairwise is feasible and correct.
-        # k-NN approximation saved for T>4K (paper experiments).
+        # --- EUCLIDEAN DISTANCE WITH FORCE FIELD ---
+        # Space is flat. Softplus metric scales distance per-dimension.
+        # k-NN retrieval is correct because L2 distances are true distances.
         
         # Pairwise direction vectors
         diff = centers.unsqueeze(3) - centers.unsqueeze(2)  # (B, H, T, T, d_h)
 
-        # Asymmetric metric: spacelike=average, timelike=source only
+        # Symmetric metric averaging (both endpoints contribute equally)
         metric_i = metric.unsqueeze(3)  # (B, H, T, 1, d_h)
         metric_j = metric.unsqueeze(2)  # (B, H, 1, T, d_h)
         metric_avg = (metric_i + metric_j) * 0.5
-        is_timelike = (metric_avg < 0)
-        eff_metric = torch.where(is_timelike, metric_j.expand_as(metric_avg), metric_avg)
 
-        # Pseudo-Riemannian distance
-        dist_sq = (diff * diff * eff_metric).sum(-1)  # (B, H, T, T)
+        # Metric-weighted Euclidean distance
+        dist_sq = (diff * diff * metric_avg).sum(-1)  # (B, H, T, T)
 
         # Routing weights via single softmax
         temp = self.temperature.to(dtype=dist_sq.dtype)[None, :, None, None]
