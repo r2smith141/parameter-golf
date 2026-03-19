@@ -590,16 +590,12 @@ class CausalSelfAttention(nn.Module):
         # Temperature per head (replaces q_gain)
         self.temperature = nn.Parameter(torch.full((num_heads,), qk_gain_init / math.sqrt(self.head_dim), dtype=torch.float32))
 
-        # k-NN: number of neighbors per token (sub-quadratic scaling)
-        self.topk = 128  # O(T*k) instead of O(T²)
-
         # RoPE for position encoding on centers
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         d_h = self.head_dim
-        k = min(self.topk, seqlen)  # k-NN neighbors (capped at seq length)
 
         # Project centers, metric, values
         centers = self.c_center(x).reshape(bsz, seqlen, self.num_heads, d_h).transpose(1, 2)
@@ -620,62 +616,35 @@ class CausalSelfAttention(nn.Module):
             v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)
             v = v.reshape(bsz, self.num_heads, seqlen, d_h)
 
-        # --- k-NN ROUTING: O(T*k) instead of O(T²) ---
-        # Step 1: Find k nearest centers using cheap Euclidean distance
-        # Causal: only attend to earlier tokens. Build causal Euclidean distances.
-        # Use cdist for efficiency, then mask future tokens
-        # centers: (B, H, T, d_h)
+        # --- FULL PSEUDO-RIEMANNIAN DISTANCE ---
+        # At T=1024 on H100 (80GB), full pairwise is feasible and correct.
+        # k-NN approximation saved for T>4K (paper experiments).
         
-        # Metric-scaled distance for candidate selection
-        # Pre-scale centers by metric magnitude so cdist respects geometry
-        metric_scale = metric.abs().sqrt().clamp(min=0.01)
-        centers_scaled = centers * metric_scale
-        c_flat = centers_scaled.reshape(bsz * self.num_heads, seqlen, d_h)
-        euc_dist = torch.cdist(c_flat, c_flat, p=2)  # (B*H, T, T)
-        
-        # Causal mask: set future tokens to large distance
-        causal_mask = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
-        euc_dist.masked_fill_(causal_mask.unsqueeze(0), float('inf'))
-        
-        # Select k nearest neighbors per token (indices into sequence)
-        _, topk_idx = euc_dist.topk(k, dim=-1, largest=False)  # (B*H, T, k)
-        topk_idx = topk_idx.reshape(bsz, self.num_heads, seqlen, k)
-        
-        # Step 2: Gather neighbor centers, metrics, values
-        # topk_idx: (B, H, T, k) — for each token, which k tokens to attend to
-        idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, -1, -1, d_h)  # (B, H, T, k, d_h)
-        
-        # Gather neighbor data: index into dim=2 (sequence dimension)
-        centers_j = centers.unsqueeze(2).expand(-1, -1, seqlen, -1, -1)  # (B, H, T, T, d_h)
-        centers_j = torch.gather(centers_j, 3, idx_expanded)  # (B, H, T, k, d_h)
-        
-        metric_j = metric.unsqueeze(2).expand(-1, -1, seqlen, -1, -1)
-        metric_j = torch.gather(metric_j, 3, idx_expanded)  # (B, H, T, k, d_h)
-        
-        v_j = v.unsqueeze(2).expand(-1, -1, seqlen, -1, -1)
-        v_j = torch.gather(v_j, 3, idx_expanded)  # (B, H, T, k, d_h)
-        
-        # Step 3: Compute metric-weighted distance only for k neighbors
-        centers_i = centers.unsqueeze(3)  # (B, H, T, 1, d_h)
-        metric_i = metric.unsqueeze(3)    # (B, H, T, 1, d_h)
-        
-        diff = centers_i - centers_j  # (B, H, T, k, d_h)
-        
-        # Asymmetric metric: spacelike=average, timelike=source
+        # Pairwise direction vectors
+        diff = centers.unsqueeze(3) - centers.unsqueeze(2)  # (B, H, T, T, d_h)
+
+        # Asymmetric metric: spacelike=average, timelike=source only
+        metric_i = metric.unsqueeze(3)  # (B, H, T, 1, d_h)
+        metric_j = metric.unsqueeze(2)  # (B, H, 1, T, d_h)
         metric_avg = (metric_i + metric_j) * 0.5
         is_timelike = (metric_avg < 0)
-        eff_metric = torch.where(is_timelike, metric_j, metric_avg)
-        
-        # Pseudo-Riemannian distance for k neighbors only
-        dist_sq = (diff * diff * eff_metric).sum(-1)  # (B, H, T, k)
-        
-        # Step 4: Softmax over k neighbors
+        eff_metric = torch.where(is_timelike, metric_j.expand_as(metric_avg), metric_avg)
+
+        # Pseudo-Riemannian distance
+        dist_sq = (diff * diff * eff_metric).sum(-1)  # (B, H, T, T)
+
+        # Routing weights via single softmax
         temp = self.temperature.to(dtype=dist_sq.dtype)[None, :, None, None]
         logits = -dist_sq * temp
-        weights = F.softmax(logits, dim=-1)  # (B, H, T, k)
-        
-        # Step 5: Weighted sum of neighbor values
-        y = (weights.unsqueeze(-1) * v_j).sum(3)  # (B, H, T, d_h)
+
+        # Causal mask
+        causal_mask = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
+        logits = logits.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        weights = F.softmax(logits, dim=-1)
+
+        # Value aggregation
+        y = (weights.unsqueeze(-1) * v.unsqueeze(2)).sum(3)  # (B, H, T, d_h)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
