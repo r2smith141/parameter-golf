@@ -626,9 +626,11 @@ class CausalSelfAttention(nn.Module):
         # Use cdist for efficiency, then mask future tokens
         # centers: (B, H, T, d_h)
         
-        # Euclidean distance for candidate selection (cheap, no metric)
-        # Reshape for cdist: (B*H, T, d_h)
-        c_flat = centers.reshape(bsz * self.num_heads, seqlen, d_h)
+        # Metric-scaled distance for candidate selection
+        # Pre-scale centers by metric magnitude so cdist respects geometry
+        metric_scale = metric.abs().sqrt().clamp(min=0.01)
+        centers_scaled = centers * metric_scale
+        c_flat = centers_scaled.reshape(bsz * self.num_heads, seqlen, d_h)
         euc_dist = torch.cdist(c_flat, c_flat, p=2)  # (B*H, T, T)
         
         # Causal mask: set future tokens to large distance
