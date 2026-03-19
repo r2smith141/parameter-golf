@@ -36,20 +36,22 @@ Standard attention has no geometry — Q·K is a bilinear form with no spatial s
 2. **k-NN retrieval is native** — you can sparsify attention by finding nearest neighbors in the geometric space, without any architectural changes
 3. **The metric (force field) is learned per-token** — different tokens warp the local distance function differently
 
-### Sub-Quadratic Inference (kNN Results)
+### Sparse Approximation via kNN
+
+Because the attention weights come from distances in a genuine metric space, the architecture is naturally amenable to sparse approximation. Standard dot-product attention (Q·K) is a bilinear form — not a distance metric, no triangle inequality, no spatial structure to exploit. In our Euclidean space, "nearest neighbors" is a well-defined operation.
 
 Tested on a trained 13.6M param model (v8_vmlp, 200 epochs, OpenWebText):
 
-| k (neighbors) | PPL | Δ vs full | Compute saved |
-|---|---|---|---|
-| full O(T²) | 126.4 | — | 0% |
-| 128 | 127.2 | +0.6% | 50% |
-| 64 | 131.5 | +4.0% | 75% |
-| 32 | 139.5 | +10.3% | 87% |
+| k (neighbors) | PPL | Δ vs full | 
+|---|---|---|
+| full O(T²) | 126.4 | — |
+| 128 | 127.2 | +0.6% |
+| 64 | 131.5 | +4.0% |
+| 32 | 139.5 | +10.3% |
 
-**k=128 loses only 0.6% quality at half the compute.** A vanilla transformer has no space to do k-NN in — this capability is unique to geometric attention.
+At this scale, k=128 loses only 0.6% quality. The geometric structure opens optimization paths (spatial indexing, locality-sensitive hashing, hierarchical approximations) that aren't available to standard attention. Whether these scale to larger models and longer sequences is an open question — the curse of dimensionality at high d_head is a real challenge.
 
-*Note: Competition eval uses full O(T²) attention. kNN is for deployment scaling.*
+*Competition eval uses full O(T²) attention.*
 
 ## Quick Start
 
